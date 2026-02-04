@@ -1,6 +1,6 @@
 ### SCREPING USAHA 5171 ###
 
-### Langkah-Langkah (Dari install Requirements sampai memulai Scraping Usaha ###
+### Langkah-Langkah (Dari install Requirements sampai memulai Scraping Usaha) ###
 
 1. Siapkan file test.xlsx (jika ingin mengulang scraping berkali-kali format harus sama persis tinggal mengisi sesuai file test.xlsx saat ini - output dari script di hapus terlebih dahulu)
 2. Double Click run\_install.bat
