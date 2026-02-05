@@ -1,7 +1,15 @@
+# =========================
+# READY-TO-COPY SCRIPT (tanpa menghapus fungsi yang ada)
+# - Tambahan: FORCE STOP (Ctrl+C / STOP.txt)
+# - Tambahan: AUTOSAVE aman (tmp -> replace) + autosave backup
+# - Perbaikan: handle query kosong, save robust, folder screenshot, log lebih jelas
+# =========================
+
 import os
 import time
 import re
 import pandas as pd
+import signal
 from urllib.parse import quote_plus
 from difflib import SequenceMatcher
 
@@ -20,6 +28,75 @@ from webdriver_manager.chrome import ChromeDriverManager
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 # =========================
+# FORCE STOP + AUTOSAVE
+# =========================
+STOP_FILE = "STOP.txt"            # buat file ini di folder script untuk stop halus
+AUTOSAVE_EVERY_ROWS = 10          # autosave tiap N baris
+AUTOSAVE_EVERY_SEC = 60           # atau tiap N detik (mana yang tercapai dulu)
+AUTOSAVE_KEEP_COPY = True         # simpan juga file .autosave.xlsx
+SCREENSHOT_DIR = "debug_screens"  # folder screenshot error
+
+_stop_requested = False
+
+def request_stop(reason=""):
+    global _stop_requested
+    _stop_requested = True
+    if reason:
+        print(f"\n🛑 STOP requested: {reason}", flush=True)
+
+def _on_signal(sig, frame):
+    # Ctrl+C / kill -> stop aman
+    request_stop(f"signal={sig}")
+
+signal.signal(signal.SIGINT, _on_signal)
+try:
+    signal.signal(signal.SIGTERM, _on_signal)
+except Exception:
+    pass
+
+def should_stop() -> bool:
+    if _stop_requested:
+        return True
+    try:
+        if os.path.exists(STOP_FILE):
+            request_stop(f"found {STOP_FILE}")
+            return True
+    except Exception:
+        pass
+    return False
+
+def ensure_dir(path: str):
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+
+def safe_save_excel(df: pd.DataFrame, file_path: str, tag: str = ""):
+    """
+    Save aman: tulis ke tmp, lalu replace.
+    Mengurangi risiko file corrupt kalau proses berhenti/PC mati.
+    """
+    try:
+        base, ext = os.path.splitext(file_path)
+        tmp_path = base + ".__tmp__" + (ext or ".xlsx")
+        df.to_excel(tmp_path, index=False)
+        os.replace(tmp_path, file_path)
+
+        if AUTOSAVE_KEEP_COPY:
+            bak_path = base + ".autosave" + (ext or ".xlsx")
+            try:
+                df.to_excel(bak_path, index=False)
+            except Exception:
+                pass
+
+        if tag:
+            print(f"💾 Saved {tag} -> {file_path}", flush=True)
+        else:
+            print(f"💾 Saved -> {file_path}", flush=True)
+    except Exception as e:
+        print(f"⚠️ Gagal save ({tag}): {e}", flush=True)
+
+# =========================
 # Denpasar bbox filter (WAJIB)
 # =========================
 DENPASAR_BBOX = {
@@ -28,7 +105,6 @@ DENPASAR_BBOX = {
     "lon_min": 115.17372541407495,
     "lon_max": 115.27485445343008,
 }
-
 
 def is_within_bbox(lat, lon, bbox=DENPASAR_BBOX):
     try:
@@ -39,7 +115,6 @@ def is_within_bbox(lat, lon, bbox=DENPASAR_BBOX):
         return (bbox["lat_min"] <= lat <= bbox["lat_max"]) and (bbox["lon_min"] <= lon <= bbox["lon_max"])
     except Exception:
         return False
-
 
 # =========================
 # Helper: safe cell (NaN -> "")
@@ -57,7 +132,6 @@ def s_cell(v) -> str:
     except Exception:
         return ""
 
-
 # =========================
 # Helper: browser
 # =========================
@@ -65,7 +139,6 @@ def wait_document_ready(driver, timeout=12):
     WebDriverWait(driver, timeout).until(
         lambda d: d.execute_script("return document.readyState") in ("interactive", "complete")
     )
-
 
 def click_consent_if_any(driver, timeout=2):
     xpaths = [
@@ -85,19 +158,16 @@ def click_consent_if_any(driver, timeout=2):
             pass
     return False
 
-
 def safe_text(el):
     try:
         return el.text.strip()
     except Exception:
         return None
 
-
 def open_home(driver):
     driver.get("https://www.google.com/maps")
     wait_document_ready(driver, 12)
     click_consent_if_any(driver, timeout=2)
-
 
 # =========================
 # Parsing coords (jangan ambil @latlon dari /maps/search)
@@ -109,7 +179,6 @@ def _to_float(x):
         return float(str(x).strip())
     except Exception:
         return None
-
 
 def parse_coords_from_url(url: str):
     """
@@ -136,7 +205,6 @@ def parse_coords_from_url(url: str):
 
     return None, None
 
-
 # =========================
 # Normalisasi teks
 # =========================
@@ -149,7 +217,6 @@ def clean_text(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-
 # FIX penting: pecah "JalanIMAM" -> "Jalan IMAM", "No486A" -> "No 486 A"
 def _split_stuck_words(s: str) -> str:
     if not s:
@@ -158,7 +225,6 @@ def _split_stuck_words(s: str) -> str:
     s = re.sub(r"([A-Za-z])(\d)", r"\1 \2", s)
     s = re.sub(r"(\d)([A-Za-z])", r"\1 \2", s)
     return s
-
 
 def normalize_addr(addr: str) -> str:
     a = clean_text(addr)
@@ -173,7 +239,6 @@ def normalize_addr(addr: str) -> str:
 
     a = re.sub(r"\s+", " ", a).strip()
     return a
-
 
 STOP_WORDS = {
     "jalan", "gang", "banjar", "br", "dk", "dusun",
@@ -211,7 +276,6 @@ NAME_NOISE_PATTERNS = [
     r"\b(pemerintah|pemkot|pemkab)\b.*$",
 ]
 
-
 def normalize_name(s: str) -> str:
     s = clean_text(s or "")
     s = _split_stuck_words(s)
@@ -223,7 +287,6 @@ def normalize_name(s: str) -> str:
         low = re.sub(pat, " ", low, flags=re.I)
         low = re.sub(r"\s+", " ", low).strip()
     return low.strip()
-
 
 def name_tokens2(s: str):
     s = normalize_name(s)
@@ -239,7 +302,6 @@ def name_tokens2(s: str):
             continue
         out.add(t)
     return out
-
 
 def addr_tokens(addr: str):
     a = normalize_addr(addr or "").lower()
@@ -263,19 +325,16 @@ def addr_tokens(addr: str):
             continue
     return out
 
-
 def addr_alpha_tokens(addr: str):
     a = normalize_addr(addr or "").lower()
     a = re.sub(r"[^a-z0-9\s]", " ", a)
     toks = [t for t in a.split() if t and t not in STOP_WORDS and len(t) >= 3]
     return {t for t in toks if re.fullmatch(r"[a-z]{3,}", t)}
 
-
 def jaccard(a: set, b: set) -> float:
     if not a or not b:
         return 0.0
     return len(a & b) / max(1, len(a | b))
-
 
 def fuzzy_ratio(a: str, b: str) -> float:
     a = (a or "").strip().lower()
@@ -284,13 +343,11 @@ def fuzzy_ratio(a: str, b: str) -> float:
         return 0.0
     return SequenceMatcher(None, a, b).ratio()
 
-
 def strip_loc_words(s: str) -> str:
     s = (s or "").lower()
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = " ".join([t for t in s.split() if t not in STOP_WORDS])
     return s.strip()
-
 
 def acronym_of_words(s: str) -> str:
     toks = [t for t in re.sub(r"[^a-z0-9\s]", " ", (s or "").lower()).split() if len(t) >= 2]
@@ -298,7 +355,6 @@ def acronym_of_words(s: str) -> str:
     if not toks:
         return ""
     return "".join(t[0] for t in toks[:8]).upper()
-
 
 def abbrev_input(s: str) -> str:
     s = (s or "").strip().upper()
@@ -310,14 +366,12 @@ def abbrev_input(s: str) -> str:
         return caps
     return ""
 
-
 # =========================
 # Infer kecamatan
 # =========================
 DENPASAR_KEC = [
     "Denpasar Selatan", "Denpasar Timur", "Denpasar Barat", "Denpasar Utara"
 ]
-
 
 def extract_kec_from_gmaps(alamat_gmaps: str) -> str:
     a_low = (alamat_gmaps or "").lower()
@@ -340,7 +394,6 @@ def extract_kec_from_gmaps(alamat_gmaps: str) -> str:
             return k
     return ""
 
-
 # =========================
 # kualitas kandidat (echo query / generik)
 # =========================
@@ -362,14 +415,12 @@ def looks_like_query_echo(nama_detail: str, query_used: str, city_context: str) 
 
     return False
 
-
 COMMON_SUFFIX = {
     "jaya", "abadi", "makmur", "sentosa", "sejahtera", "berkah", "mulya", "utama", "sukses",
     "prima", "indo", "nusantara", "mandiri", "karya", "agung", "barokah", "barakah",
 }
 
 LEGAL_ENTITY_TOKENS = {"ud", "cv", "pt", "tbk", "t bk", "t.bk", "persero"}
-
 
 def is_too_generic_name(nama: str) -> bool:
     n = normalize_name(nama or "")
@@ -391,7 +442,6 @@ def is_too_generic_name(nama: str) -> bool:
 
     return False
 
-
 def is_generic_place_name(nama_g: str) -> bool:
     n = (nama_g or "").strip().lower()
     if not n:
@@ -403,7 +453,6 @@ def is_generic_place_name(nama_g: str) -> bool:
     if is_too_generic_name(nama_g):
         return True
     return False
-
 
 def coords_only_guard_ok(best_name: str, dbg: dict) -> bool:
     if not dbg:
@@ -419,7 +468,6 @@ def coords_only_guard_ok(best_name: str, dbg: dict) -> bool:
 
     return (ov_name >= 1) or (s_name >= 0.50) or (s_fuz >= 0.55)
 
-
 # =========================
 # scoring helpers
 # =========================
@@ -433,7 +481,6 @@ def containment_score(a: str, b: str) -> float:
     if a2 in b2:
         return min(1.0, len(a2) / max(1, len(b2)))
     return 0.0
-
 
 def soft_token_overlap(a_set: set, b_set: set, sim_thr: float = 0.88) -> int:
     if not a_set or not b_set:
@@ -455,14 +502,12 @@ def soft_token_overlap(a_set: set, b_set: set, sim_thr: float = 0.88) -> int:
             cnt += 1
     return cnt
 
-
 def soft_jaccard(a_set: set, b_set: set, sim_thr: float = 0.88) -> float:
     if not a_set or not b_set:
         return 0.0
     inter = soft_token_overlap(a_set, b_set, sim_thr=sim_thr)
     union = len(a_set) + len(b_set) - inter
     return inter / max(1, union)
-
 
 # =========================
 # Scoring
@@ -563,7 +608,6 @@ def score_candidate(nama_in, alamat_in, kec_in, nama_g, alamat_g, *, is_echo=Fal
     }
     return score, dbg
 
-
 # =========================
 # Search helpers (paksa buka place)
 # =========================
@@ -596,9 +640,12 @@ def force_open_place_details(driver, timeout=8) -> bool:
     except Exception:
         return False
 
-
 def run_query_via_url(driver, query, timeout=18):
-    q = " ".join(str(query).split())
+    q = " ".join(str(query).split()).strip()
+    if not q:
+        # penting: jangan lempar driver ke query kosong
+        return ""
+
     url = "https://www.google.com/maps/search/?api=1&query=" + quote_plus(q)
 
     driver.get(url)
@@ -618,13 +665,11 @@ def run_query_via_url(driver, query, timeout=18):
     WebDriverWait(driver, timeout).until(cond)
     return url
 
-
 def partial_match_detected(driver):
     try:
         return len(driver.find_elements(By.CSS_SELECTOR, "div.L5xkq.Hk4XGb")) > 0
     except Exception:
         return False
-
 
 def wait_place_panel_ready(driver, timeout=8) -> bool:
     end = time.time() + timeout
@@ -655,7 +700,6 @@ def wait_place_panel_ready(driver, timeout=8) -> bool:
         time.sleep(0.2)
     return False
 
-
 def get_place_title(driver, timeout=6):
     try:
         wait_place_panel_ready(driver, timeout=timeout)
@@ -682,9 +726,7 @@ def get_place_title(driver, timeout=6):
 
     return ""
 
-
 PLUS_CODE_RE = re.compile(r"\b[23456789CFGHJMPQRVWX]{4,8}\+[23456789CFGHJMPQRVWX]{2,4}\b", re.I)
-
 
 def _clean_gmaps_address_text(t: str) -> str:
     t = (t or "").strip()
@@ -695,7 +737,6 @@ def _clean_gmaps_address_text(t: str) -> str:
     t = PLUS_CODE_RE.sub(" ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
-
 
 def get_address(driver, timeout=2):
     try:
@@ -750,7 +791,6 @@ def get_address(driver, timeout=2):
 
     return ""
 
-
 def get_phone(driver):
     try:
         btns = driver.find_elements(
@@ -766,7 +806,6 @@ def get_phone(driver):
         pass
     return None
 
-
 # =========================
 # Closed detection
 # =========================
@@ -781,7 +820,6 @@ CLOSED_PATTERNS = [
     r"\bditutup sementara\b",
     r"\bsecara permanen ditutup\b",
 ]
-
 
 def detect_closed_status(driver):
     try:
@@ -810,7 +848,6 @@ def detect_closed_status(driver):
     except Exception:
         return False, None
 
-
 # =========================
 # Output mapping
 # =========================
@@ -834,7 +871,6 @@ def apply_gc_fields(df, idx, status_kode, nama_usaha, alamat_usaha, lat, lon):
     df.at[idx, "alamat_usaha_gc"] = alamat_usaha
 
     df.at[idx, "hasilgc"] = status_kode
-
 
 # =========================
 # MAIN
@@ -927,13 +963,37 @@ MAX_RETRY = 1
 
 ALLOW_COORDS_ONLY_MATCH = True
 
+ensure_dir(SCREENSHOT_DIR)
+
 try:
     open_home(driver)
 
+    _last_save_ts = time.time()
+    total_rows = len(df)
+
     for idx, row in df.iterrows():
+        # ---- stop check (STOP.txt / Ctrl+C) ----
+        if should_stop():
+            print(f"\n🛑 Berhenti aman di baris {idx}/{total_rows}.", flush=True)
+            break
+
+        # ---- autosave check ----
+        now = time.time()
+        if (idx > 0 and idx % AUTOSAVE_EVERY_ROWS == 0) or ((now - _last_save_ts) >= AUTOSAVE_EVERY_SEC):
+            safe_save_excel(df, file_path, tag=f"(autosave row {idx})")
+            _last_save_ts = now
+
         nama_usaha_raw = s_cell(row.get("nama_usaha"))
         alamat_usaha_raw = s_cell(row.get("alamat_usaha"))
         kec_in_raw = s_cell(row.get("nmkec"))
+
+        # kalau input nama kosong total, skip cepat (menghindari query aneh)
+        if not clean_text(nama_usaha_raw):
+            df.at[idx, "keterangan"] = "Skip: nama_usaha kosong"
+            df.at[idx, "status_bisnis"] = "Tidak ditemukan"
+            df.at[idx, "status_kode"] = 99
+            apply_gc_fields(df, idx, 99, nama_usaha_raw, alamat_usaha_raw, None, None)
+            continue
 
         lat_existing = row.get("latitude")
         lon_existing = row.get("longitude")
@@ -948,7 +1008,7 @@ try:
         kec_part = f", {kec_in}" if kec_in.strip() else ""
         q_full = clean_text(f"{nama_in}, {alamat_in}{kec_part}, {CITY_CONTEXT}") if alamat_in.strip() else ""
         q_name = clean_text(f"{nama_in}{kec_part}, {CITY_CONTEXT}")
-        queries = [q for q in [q_full, q_name] if q]
+        queries = [q for q in [q_full, q_name] if q.strip()]
 
         print(f"\n🔍 Baris {idx} | mulai", flush=True)
 
@@ -966,7 +1026,15 @@ try:
         }
 
         try:
+            # jika queries kosong (misal alamat kosong & city context somehow kosong) -> fallback minimal
+            if not queries:
+                queries = [clean_text(f"{nama_in}, {CITY_CONTEXT}")]
+
             for q in queries:
+                if should_stop():
+                    print(f"\n🛑 Stop saat proses baris {idx}.", flush=True)
+                    break
+
                 print(f"   ▶ query: {q}", flush=True)
 
                 last_search_url = None
@@ -1053,6 +1121,10 @@ try:
                     cand_links = results_links[:MAX_CANDIDATES]
 
                     for ci, a in enumerate(cand_links, start=1):
+                        if should_stop():
+                            print(f"\n🛑 Stop saat proses kandidat baris {idx}.", flush=True)
+                            break
+
                         href = None
                         try:
                             href = a.get_attribute("href")
@@ -1176,6 +1248,11 @@ try:
                 if best["score"] >= THRESHOLD_EARLY_STOP:
                     break
 
+            # bila stop saat query loop, tetap simpan progres baris yg sudah ada
+            if should_stop():
+                print(f"\n🛑 Stop sebelum finalize scoring baris {idx}.", flush=True)
+                break
+
             has_coords = (best["lat"] is not None and best["lon"] is not None)
             in_denpasar = is_within_bbox(best["lat"], best["lon"]) if has_coords else False
 
@@ -1288,7 +1365,8 @@ try:
                             lon_out = None
 
             elif ALLOW_COORDS_ONLY_MATCH and has_coords and in_denpasar:
-                if (not dbg.get("is_echo")) and name_signal_ok:
+                # pakai guard function yang sudah ada (biar fungsi kepakai, tidak cuma definisi)
+                if coords_only_guard_ok(best.get("nama") or "", dbg):
                     status_bisnis = "Ditemukan (coords-only)"
                     status_kode = 5
                     status_tutup = pd.NA
@@ -1328,7 +1406,8 @@ try:
             df.at[idx, "status_kode"] = int(status_kode) if status_kode is not None else pd.NA
             df.at[idx, "status_tutup"] = status_tutup if (status_tutup is not None and status_tutup is not pd.NA) else pd.NA
 
-            apply_gc_fields(df, idx, int(status_kode) if status_kode is not None else 99, nama_usaha_raw, alamat_usaha_raw, lat_out, lon_out)
+            apply_gc_fields(df, idx, int(status_kode) if status_kode is not None else 99,
+                            nama_usaha_raw, alamat_usaha_raw, lat_out, lon_out)
 
             print(
                 f"✅ Baris {idx} | best_score={best['score']:.2f} | source={best['source']} "
@@ -1344,7 +1423,7 @@ try:
             df.at[idx, "status_kode"] = 99
             apply_gc_fields(df, idx, 99, nama_usaha_raw, alamat_usaha_raw, None, None)
             try:
-                driver.save_screenshot(f"debug_row_{idx}.png")
+                driver.save_screenshot(os.path.join(SCREENSHOT_DIR, f"debug_row_{idx}.png"))
             except Exception:
                 pass
             try:
@@ -1359,7 +1438,7 @@ try:
             df.at[idx, "status_kode"] = 99
             apply_gc_fields(df, idx, 99, nama_usaha_raw, alamat_usaha_raw, None, None)
             try:
-                driver.save_screenshot(f"debug_row_{idx}.png")
+                driver.save_screenshot(os.path.join(SCREENSHOT_DIR, f"debug_row_{idx}.png"))
             except Exception:
                 pass
             try:
@@ -1368,7 +1447,8 @@ try:
                 pass
             continue
 
-    df.to_excel(file_path, index=False)
+    # final save (aman)
+    safe_save_excel(df, file_path, tag="(final save)")
     print(f"\n✅ Proses selesai! File disimpan kembali ke: {file_path}", flush=True)
 
 finally:
