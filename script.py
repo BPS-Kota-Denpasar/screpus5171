@@ -227,36 +227,47 @@ def _split_stuck_words(s: str) -> str:
     return s
     
 
+def extract_house_numbers(s: str) -> set:
+    if not s:
+        return set()
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    nums = set()
+    for m in re.finditer(r"\b(?:no|nomor)\s*([0-9]{1,4}[a-z]?)\b", s):
+        nums.add(m.group(1))
+    for m in re.finditer(r"\b([0-9]{1,4}[a-z]?)\b", s):
+        nums.add(m.group(1))
+    return nums
+
+
 def compact_addr_for_query(addr: str) -> str:
-    """
-    Buat alamat ringkas untuk query:
-    - Ambil 'Jalan ...' + nomor (kalau ada)
-    - Buang token yang sering bikin Maps bingung
-    """
     a = normalize_addr(addr or "")
     if not a:
         return ""
 
     low = a.lower()
 
-    # Ambil bagian setelah "Jalan ..." kalau ada
+    # Ambil bagian setelah "Jalan ..."
     m = re.search(r"\b(jalan\s+[a-z0-9\s\-\.]{5,})", a, flags=re.I)
     base = m.group(1).strip() if m else a
 
-    # Potong setelah koma kedua biar ringkas
+    # Ringkas: ambil max 2 segmen
     parts = [p.strip() for p in re.split(r"[,\|]", base) if p.strip()]
     base2 = ", ".join(parts[:2]) if parts else base
 
-    # Cari "No ..." kalau ada dan belum masuk
-    m2 = re.search(r"\b(no\.?|nomor)\s*([0-9]{1,4}\s*[a-z]?)\b", low, flags=re.I)
-    if m2:
-        no_txt = f"No {m2.group(2).strip().upper()}"
-        if no_txt.lower() not in base2.lower():
-            base2 = f"{base2} {no_txt}"
+    # Token nomor
+    base_nums = extract_house_numbers(base2)
+    input_nums = extract_house_numbers(a)
 
-    # rapikan spasi
-    base2 = re.sub(r"\s+", " ", base2).strip()
-    return base2
+    # Tambahkan nomor rumah jika belum ada
+    m2 = re.search(r"\b(?:no|nomor)\s*([0-9]{1,4}[a-z]?)\b", low)
+    if m2:
+        num = m2.group(1).lower()
+        if num not in base_nums:
+            base2 = f"{base2} No {num.upper()}"
+
+    return re.sub(r"\s+", " ", base2).strip()
+
 
 
 def build_queries_adaptive(nama_in, alamat_in_raw, kec_in, city_context):
