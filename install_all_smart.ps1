@@ -5,7 +5,7 @@
 # - Install Python 3.14 (winget source=winget)
 # - Add Python + Scripts to USER PATH (auto detect latest Python*)
 # - Install Google Chrome (winget source=winget)
-# - Upgrade pip (pakai py -m pip)
+# - Upgrade pip (pakai py.exe atau python.exe yang terdeteksi)
 # - Install pip packages hanya yang belum ada: pandas, openpyxl, selenium, webdriver-manager
 #
 # Jalankan:
@@ -93,6 +93,71 @@ function Winget-Install-IfMissing($id, $nameForLog, $source = "winget") {
   Write-Host "Done: $nameForLog" -ForegroundColor Green
 }
 
+# -------------------------
+# PY RESOLVER (anti-stuck)
+# -------------------------
+$script:PYRUN = $null
+
+function Find-PyLauncherPath {
+  $candidates = @(
+    "$Env:WINDIR\py.exe",
+    "$Env:WINDIR\System32\py.exe",
+    "$Env:LOCALAPPDATA\Programs\Python\Launcher\py.exe",
+    "$Env:ProgramFiles\Python\Launcher\py.exe",
+    "$Env:ProgramFiles(x86)\Python\Launcher\py.exe"
+  )
+  foreach ($c in $candidates) {
+    if (Test-Path $c) { return $c }
+  }
+  $cmd = Get-Command py -ErrorAction SilentlyContinue
+  if ($cmd) { return $cmd.Source }
+  return $null
+}
+
+function Find-PythonExeFromLocalAppData {
+  $pyBase = Join-Path $env:LOCALAPPDATA "Programs\Python"
+  if (-not (Test-Path $pyBase)) { return $null }
+
+  $pythonExe = Get-ChildItem -Path $pyBase -Recurse -Filter python.exe -ErrorAction SilentlyContinue |
+  Where-Object { $_.FullName -match '\\Python\d+\\python\.exe$' } |
+  Sort-Object FullName -Descending |
+  Select-Object -First 1
+
+  if ($pythonExe) { return $pythonExe.FullName }
+  return $null
+}
+
+function Ensure-PyRunner {
+  Step "Resolve Python runner (py or python) - anti stuck"
+
+  $pyExe = Find-PyLauncherPath
+  if ($pyExe) {
+    $script:PYRUN = $pyExe
+    Write-Host "OK: py launcher ditemukan: $pyExe" -ForegroundColor Green
+    & $script:PYRUN -V
+    return
+  }
+
+  $pythonExe = Find-PythonExeFromLocalAppData
+  if ($pythonExe) {
+    $script:PYRUN = $pythonExe
+    Write-Host "WARN: py launcher tidak ditemukan, pakai python.exe: $pythonExe" -ForegroundColor Yellow
+    & $script:PYRUN -V
+    return
+  }
+
+  # Last fallback: coba python dari PATH (kalau ada)
+  $cmd = Get-Command python -ErrorAction SilentlyContinue
+  if ($cmd) {
+    $script:PYRUN = $cmd.Source
+    Write-Host "WARN: pakai python dari PATH: $($cmd.Source)" -ForegroundColor Yellow
+    & $script:PYRUN -V
+    return
+  }
+
+  throw "Tidak menemukan py.exe maupun python.exe. Kemungkinan install Python gagal, diblok policy, atau lokasi instalasi berbeda."
+}
+
 function Ensure-Python {
   Step "Ensure Python Install Manager"
   Winget-Install-IfMissing "Python.PythonInstallManager" "Python Install Manager" "winget"
@@ -100,14 +165,9 @@ function Ensure-Python {
   Step "Ensure Python 3.14"
   Winget-Install-IfMissing "Python.Python.3.14" "Python 3.14" "winget"
 
-  Step "Check py launcher"
-  if (-not (Has-Command "py")) {
-    Write-Host "Perintah 'py' belum terdeteksi. Tutup PowerShell dan buka lagi, lalu jalankan ulang script." -ForegroundColor Yellow
-    exit 1
-  }
-
-  Write-Host "Python OK:"
-  py -V
+  # jangan exit kalau 'py' belum kebaca di sesi ini.
+  # langsung resolve runner yang benar (py.exe atau python.exe).
+  Ensure-PyRunner
 }
 
 function Ensure-Py-Path {
@@ -162,6 +222,9 @@ function Ensure-Py-Path {
   else {
     Write-Host "PATH already OK."
   }
+
+  # Re-resolve runner setelah PATH di-update (kadang baru kebaca)
+  Ensure-PyRunner
 }
 
 function Ensure-Chrome {
@@ -190,16 +253,25 @@ function Ensure-Chrome {
 
 function Ensure-Pip {
   Step "Upgrade pip"
-  py -m pip install --upgrade pip
-  py -m pip --version
+  if (-not $script:PYRUN) { Ensure-PyRunner }
+
+  & $script:PYRUN -m pip install --upgrade pip
+  & $script:PYRUN -m pip --version
 }
 
 function Pip-Package-Installed($pkg) {
-  try { py -m pip show $pkg 1>$null 2>$null; return $true } catch { return $false }
+  try {
+    if (-not $script:PYRUN) { Ensure-PyRunner }
+    & $script:PYRUN -m pip show $pkg 1>$null 2>$null
+    return $true
+  }
+  catch { return $false }
 }
 
 function Ensure-Pip-Packages {
   Step "Install pip packages (only missing)"
+  if (-not $script:PYRUN) { Ensure-PyRunner }
+
   $packages = @("pandas", "openpyxl", "selenium", "webdriver-manager")
 
   foreach ($p in $packages) {
@@ -208,13 +280,13 @@ function Ensure-Pip-Packages {
     }
     else {
       Write-Host "Install: $p ..." -ForegroundColor Yellow
-      py -m pip install $p
+      & $script:PYRUN -m pip install $p
       Write-Host "Done: $p" -ForegroundColor Green
     }
   }
 
-  Step "Freeze (verifikasi)"
-  py -m pip show pandas openpyxl selenium webdriver-manager | Select-String "Name|Version"
+  Step "Verifikasi versi"
+  & $script:PYRUN -m pip show pandas openpyxl selenium webdriver-manager | Select-String "Name|Version"
 }
 
 try {
