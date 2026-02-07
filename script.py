@@ -1602,13 +1602,32 @@ try:
                             addr_lock_ok = (alpha_overlap >= 1) or (ov_addr >= 2) or (s_addr >= 0.18)
 
                         if not addr_lock_ok:
-                            status_bisnis = (
-                                f"Tidak ditemukan (alamat_tidak_match, score={best['score']:.2f}, "
-                                f"alpha_overlap={alpha_overlap}, ov_addr={ov_addr}, s_addr={s_addr:.2f})"
-                            )
-                            status_kode = 99
-                            lat_out = None
-                            lon_out = None
+                            # ===== KODE 2: nama kuat tapi alamat beda -> perlu dicek =====
+                            sname = float(dbg.get("s_name", 0.0) or 0.0)
+                            sfuz  = float(dbg.get("s_name_fuzzy", 0.0) or 0.0)
+
+                            # ambang "nama kuat" (silakan sesuaikan)
+                            name_strong_for_review = (sname >= 0.85) or (sfuz >= 0.85)
+
+                            if name_strong_for_review:
+                                status_bisnis = (
+                                    f"Perlu dicek (nama kuat; alamat beda) "
+                                    f"(score={best['score']:.2f}, alpha_overlap={alpha_overlap}, "
+                                    f"ov_addr={ov_addr}, s_addr={s_addr:.2f})"
+                                )
+                                status_kode = 2  # <-- KODE KHUSUS
+                                status_tutup = pd.NA
+                                lat_out = best["lat"]
+                                lon_out = best["lon"]
+                            else:
+                                status_bisnis = (
+                                    f"Tidak ditemukan (alamat_tidak_match, score={best['score']:.2f}, "
+                                    f"alpha_overlap={alpha_overlap}, ov_addr={ov_addr}, s_addr={s_addr:.2f})"
+                                )
+                                status_kode = 99
+                                lat_out = None
+                                lon_out = None
+
 
                 # ===== kalau salah satu alamat kosong, pakai nama sebagai sinyal =====
                 else:
