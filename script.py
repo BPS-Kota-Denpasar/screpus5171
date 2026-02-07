@@ -225,6 +225,84 @@ def _split_stuck_words(s: str) -> str:
     s = re.sub(r"([A-Za-z])(\d)", r"\1 \2", s)
     s = re.sub(r"(\d)([A-Za-z])", r"\1 \2", s)
     return s
+    
+
+def compact_addr_for_query(addr: str) -> str:
+    """
+    Buat alamat ringkas untuk query:
+    - Ambil 'Jalan ...' + nomor (kalau ada)
+    - Buang token yang sering bikin Maps bingung
+    """
+    a = normalize_addr(addr or "")
+    if not a:
+        return ""
+
+    low = a.lower()
+
+    # Ambil bagian setelah "Jalan ..." kalau ada
+    m = re.search(r"\b(jalan\s+[a-z0-9\s\-\.]{5,})", a, flags=re.I)
+    base = m.group(1).strip() if m else a
+
+    # Potong setelah koma kedua biar ringkas
+    parts = [p.strip() for p in re.split(r"[,\|]", base) if p.strip()]
+    base2 = ", ".join(parts[:2]) if parts else base
+
+    # Cari "No ..." kalau ada dan belum masuk
+    m2 = re.search(r"\b(no\.?|nomor)\s*([0-9]{1,4}\s*[a-z]?)\b", low, flags=re.I)
+    if m2:
+        no_txt = f"No {m2.group(2).strip().upper()}"
+        if no_txt.lower() not in base2.lower():
+            base2 = f"{base2} {no_txt}"
+
+    # rapikan spasi
+    base2 = re.sub(r"\s+", " ", base2).strip()
+    return base2
+
+
+def build_queries_adaptive(nama_in, alamat_in_raw, kec_in, city_context):
+    """
+    Generate query sedikit tapi efektif (urut dari paling informatif ke fallback).
+    Output list query unik, max 4-5.
+    """
+    nama = clean_text(nama_in)
+    kec = clean_text(kec_in)
+    addr_compact = compact_addr_for_query(alamat_in_raw)
+
+    # Varian wilayah
+    kec_part = f", {kec}" if kec else ""
+
+    q = []
+    # 1) Nama + alamat ringkas + kec + city
+    if nama and addr_compact:
+        q.append(clean_text(f"{nama}, {addr_compact}{kec_part}, {city_context}"))
+
+    # 2) Nama + kec + city (sering cepat & cukup)
+    if nama:
+        q.append(clean_text(f"{nama}{kec_part}, {city_context}"))
+
+    # 3) Alamat ringkas + nama (dibalik) (kadang ranking beda)
+    if nama and addr_compact:
+        q.append(clean_text(f"{addr_compact}, {nama}{kec_part}, {city_context}"))
+
+    # 4) Nama + city saja (fallback)
+    if nama:
+        q.append(clean_text(f"{nama}, {city_context}"))
+
+    # unique & buang kosong
+    seen = set()
+    out = []
+    for item in q:
+        item = " ".join((item or "").split()).strip()
+        if not item:
+            continue
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+
+    return out[:4]
+
 
 def normalize_addr(addr: str) -> str:
     a = clean_text(addr)
@@ -611,6 +689,102 @@ def score_candidate(nama_in, alamat_in, kec_in, nama_g, alamat_g, *, is_echo=Fal
 # =========================
 # Search helpers (paksa buka place)
 # =========================
+
+def should_early_stop(best, threshold, bbox=DENPASAR_BBOX):
+    if best["score"] < threshold:
+        return False
+    lat, lon = best.get("lat"), best.get("lon")
+    if lat is None or lon is None:
+        return False
+    if not is_within_bbox(lat, lon, bbox=bbox):
+        return False
+    dbg = best.get("dbg") or {}
+    if dbg.get("is_echo"):
+        return False
+
+    strong_name = (float(dbg.get("s_name", 0) or 0) >= 0.82) or (float(dbg.get("s_name_fuzzy", 0) or 0) >= 0.85)
+    strong_addr = (int(dbg.get("ov_addr", 0) or 0) >= 3) or (float(dbg.get("s_addr", 0) or 0) >= 0.28)
+    return strong_name or strong_addr
+
+
+def get_list_candidates_fast(driver, limit=12):
+    """
+    Ambil kandidat dari list mode tanpa klik/buka detail dulu.
+    Return list of dict: {href, name_hint, sub_hint}
+    """
+    out = []
+    try:
+        links = driver.find_elements(By.CSS_SELECTOR, "a.hfpxzc")
+        for a in links[: max(limit, 1)]:
+            href = None
+            try:
+                href = a.get_attribute("href")
+            except Exception:
+                href = None
+            if not href:
+                continue
+
+            # Nama biasanya ada di aria-label
+            name_hint = ""
+            try:
+                name_hint = (a.get_attribute("aria-label") or "").strip()
+            except Exception:
+                pass
+
+            # Coba ambil “teks sekunder” dari container card terdekat
+            # Ini agak dinamis, jadi kita buat best-effort, bukan wajib.
+            sub_hint = ""
+            try:
+                card = a.find_element(By.XPATH, "./ancestor::div[contains(@role,'article') or contains(@class,'Nv2PK')][1]")
+                # ambil beberapa teks yang mungkin berisi area/alamat singkat
+                texts = []
+                for sel in [
+                    "div.W4Efsd",  # sering memuat meta
+                    "div.W4Efsd span",
+                    "div.qBF1Pd",  # variasi lain
+                    "div.fontBodyMedium",
+                ]:
+                    try:
+                        els = card.find_elements(By.CSS_SELECTOR, sel)
+                        for e in els[:6]:
+                            t = (e.text or "").strip()
+                            if t and t.lower() not in {"hasil", "result", "results"}:
+                                texts.append(t)
+                    except Exception:
+                        pass
+                # gabungkan singkat saja
+                sub_hint = " | ".join(list(dict.fromkeys(texts))[:3]).strip()
+            except Exception:
+                pass
+
+            out.append({"href": href, "name_hint": name_hint, "sub_hint": sub_hint})
+    except Exception:
+        pass
+    return out
+
+
+def quick_score_from_list(nama_in, alamat_in, kec_in, cand_name, cand_sub):
+    """
+    Scoring cepat berbasis hint list (nama + sub text).
+    Ini bukan final, hanya untuk ranking top-k agar hemat waktu.
+    """
+    # anggap cand_sub sebagai “alamat kasar” (best-effort)
+    sc, dbg = score_candidate(
+        nama_in, alamat_in, kec_in,
+        cand_name or "", cand_sub or "",
+        is_echo=False, is_generic=is_generic_place_name(cand_name or "")
+    )
+    # sedikiit bonus kalau subtext menyebut Denpasar / kecamatan
+    low = (cand_sub or "").lower()
+    bonus = 0.0
+    if "denpasar" in low:
+        bonus += 0.04
+    if (kec_in or "").strip().lower() and (kec_in or "").strip().lower() in low:
+        bonus += 0.05
+
+    sc2 = max(0.0, min(1.2, sc + bonus))
+    return sc2, dbg
+
 def force_open_place_details(driver, timeout=8) -> bool:
     try:
         u = (driver.current_url or "").lower()
@@ -955,11 +1129,11 @@ except Exception:
 driver = webdriver.Chrome(service=service, options=options)
 driver.implicitly_wait(0.4)
 
-MAX_CANDIDATES = 2
+MAX_CANDIDATES = 10
 THRESHOLD_OK = 0.45
-THRESHOLD_EARLY_STOP = 0.65
+THRESHOLD_EARLY_STOP = 0.70
 CITY_CONTEXT = "Denpasar, Bali, Indonesia"
-MAX_RETRY = 1
+MAX_RETRY = 0
 
 ALLOW_COORDS_ONLY_MATCH = True
 
@@ -1005,10 +1179,15 @@ try:
         alamat_in = normalize_addr(alamat_usaha_raw)
         kec_in = clean_text(kec_in_raw)
 
-        kec_part = f", {kec_in}" if kec_in.strip() else ""
-        q_full = clean_text(f"{nama_in}, {alamat_in}{kec_part}, {CITY_CONTEXT}") if alamat_in.strip() else ""
-        q_name = clean_text(f"{nama_in}{kec_part}, {CITY_CONTEXT}")
-        queries = [q for q in [q_full, q_name] if q.strip()]
+        # kec_part = f", {kec_in}" if kec_in.strip() else ""
+        # q_full = clean_text(f"{nama_in}, {alamat_in}{kec_part}, {CITY_CONTEXT}") if alamat_in.strip() else ""
+        # q_name = clean_text(f"{nama_in}{kec_part}, {CITY_CONTEXT}")
+        # queries = [q for q in [q_full, q_name] if q.strip()]
+
+        queries = build_queries_adaptive(nama_in, alamat_usaha_raw, kec_in, CITY_CONTEXT)
+        if not queries:
+            queries = [clean_text(f"{nama_in}, {CITY_CONTEXT}")]
+
 
         print(f"\n🔍 Baris {idx} | mulai", flush=True)
 
@@ -1030,6 +1209,7 @@ try:
             if not queries:
                 queries = [clean_text(f"{nama_in}, {CITY_CONTEXT}")]
 
+            stop_queries = False
             for q in queries:
                 if should_stop():
                     print(f"\n🛑 Stop saat proses baris {idx}.", flush=True)
@@ -1115,24 +1295,40 @@ try:
                             "closed_type": closed_type,
                             "source": "direct/place",
                         })
+                    if should_early_stop(best, THRESHOLD_EARLY_STOP):
+                        stop_queries = True
+                        break
+    
 
                 # B) LIST MODE
                 elif results_links:
-                    cand_links = results_links[:MAX_CANDIDATES]
+                    # 1) ambil kandidat banyak tapi tanpa buka detail
+                    raw_cands = get_list_candidates_fast(driver, limit=max(8, MAX_CANDIDATES))
+                    if not raw_cands:
+                        raw_cands = [{"href": a.get_attribute("href"), "name_hint": a.get_attribute("aria-label") or "", "sub_hint": ""} 
+                                    for a in results_links[:max(8, MAX_CANDIDATES)] if a.get_attribute("href")]
 
-                    for ci, a in enumerate(cand_links, start=1):
+                    # 2) quick-score untuk ranking top-k
+                    scored = []
+                    for c in raw_cands:
+                        qs, qdbg = quick_score_from_list(nama_in, alamat_in, kec_in, c.get("name_hint",""), c.get("sub_hint",""))
+                        scored.append((qs, c))
+                    scored.sort(key=lambda x: x[0], reverse=True)
+
+                    # 3) buka detail hanya top_k (hemat waktu)
+                    TOP_OPEN = 2  # <-- bisa 2 kalau mau lebih cepat
+                    to_open = scored[:TOP_OPEN]
+
+                    for ci, (qs, c) in enumerate(to_open, start=1):
                         if should_stop():
                             print(f"\n🛑 Stop saat proses kandidat baris {idx}.", flush=True)
                             break
 
-                        href = None
-                        try:
-                            href = a.get_attribute("href")
-                        except Exception:
-                            href = None
+                        href = c.get("href")
                         if not href:
                             continue
 
+                        # buka detail kandidat pilihan
                         driver.get(href)
                         wait_document_ready(driver, 12)
                         click_consent_if_any(driver, timeout=1)
@@ -1165,7 +1361,7 @@ try:
                             dbg["coords_only_boost"] = True
 
                         print(
-                            f"   • cand#{ci} | score={sc:.2f} "
+                            f"   • cand#{ci} (pre={qs:.2f}) | score={sc:.2f} "
                             f"(ov_addr={dbg.get('ov_addr',0)}, ov_name={dbg.get('ov_name',0)}, "
                             f"s_name={dbg.get('s_name',0):.2f}, fuz={dbg.get('s_name_fuzzy',0):.2f}, "
                             f"s_addr={dbg.get('s_addr',0):.2f}, echo={dbg.get('is_echo')}, gen={dbg.get('is_generic')}) "
@@ -1184,16 +1380,45 @@ try:
                                 "lon": lon,
                                 "is_closed": is_closed,
                                 "closed_type": closed_type,
-                                "source": f"list#{ci}",
+                                "source": f"listTop#{ci}",
                             })
+
+                        # stop dini kalau sudah sangat meyakinkan + coords valid di Denpasar
+                        has_coords = (best["lat"] is not None and best["lon"] is not None)
+                        in_den = is_within_bbox(best["lat"], best["lon"]) if has_coords else False
+                        dbg_best = best.get("dbg") or {}
+
+                        strong_name = (
+                            float(dbg_best.get("s_name", 0.0) or 0.0) >= 0.82
+                            or float(dbg_best.get("s_name_fuzzy", 0.0) or 0.0) >= 0.85
+                        )
+
+                        strong_addr = (
+                            int(dbg_best.get("ov_addr", 0) or 0) >= 3
+                            or float(dbg_best.get("s_addr", 0.0) or 0.0) >= 0.28
+                        )
 
                         if best["score"] >= THRESHOLD_EARLY_STOP:
                             break
 
+                        # ✅ tambahan: kalau sudah dapat coords Denpasar + (nama kuat atau alamat kuat), stop query berikutnya
+                        if has_coords and in_den and (strong_name or strong_addr) and not dbg_best.get("is_echo"):
+                            break
+
+
+                        # kembali ke search list kalau masih perlu kandidat berikut
                         if last_search_url:
                             driver.get(last_search_url)
                             wait_document_ready(driver, 12)
                             click_consent_if_any(driver, timeout=1)
+
+                        if should_early_stop(best, THRESHOLD_EARLY_STOP):
+                            stop_queries = True
+
+                        if stop_queries:
+                            break
+    
+
 
                 # C) EMPTY FALLBACK
                 else:
@@ -1245,8 +1470,34 @@ try:
                             "source": "fallback/empty",
                         })
 
-                if best["score"] >= THRESHOLD_EARLY_STOP:
-                    break
+                        
+
+                        # stop dini kalau sudah sangat meyakinkan + coords valid di Denpasar
+                        has_coords = (best["lat"] is not None and best["lon"] is not None)
+                        in_den = is_within_bbox(best["lat"], best["lon"]) if has_coords else False
+                        dbg_best = best.get("dbg") or {}
+
+                        strong_name = (
+                            float(dbg_best.get("s_name", 0.0) or 0.0) >= 0.82
+                            or float(dbg_best.get("s_name_fuzzy", 0.0) or 0.0) >= 0.85
+                        )
+
+                        strong_addr = (
+                            int(dbg_best.get("ov_addr", 0) or 0) >= 3
+                            or float(dbg_best.get("s_addr", 0.0) or 0.0) >= 0.28
+                        )
+
+                        if best["score"] >= THRESHOLD_EARLY_STOP:
+                            break
+
+                        # ✅ tambahan: kalau sudah dapat coords Denpasar + (nama kuat atau alamat kuat), stop query berikutnya
+                        if has_coords and in_den and (strong_name or strong_addr) and not dbg_best.get("is_echo"):
+                            break
+
+                        if should_early_stop(best, THRESHOLD_EARLY_STOP):
+                            stop_queries = True
+                            break
+
 
             # bila stop saat query loop, tetap simpan progres baris yg sudah ada
             if should_stop():
@@ -1306,13 +1557,28 @@ try:
 
             elif has_coords and in_denpasar and not dbg.get("is_echo") and (score_ok or name_very_strong):
                 allow_even_if_generic = name_very_strong or (float(dbg.get("s_name_fuzzy", 0.0) or 0.0) >= 0.90)
+                strong_addr = (int(dbg.get("ov_addr", 0) or 0) >= 3) or (float(dbg.get("s_addr", 0.0) or 0.0) >= 0.35)
 
-                if (dbg.get("is_generic") and not allow_even_if_generic):
-                    status_bisnis = f"Tidak ditemukan (nama_generik, score={best['score']:.2f})"
-                    status_kode = 99
-                    status_tutup = pd.NA
-                    lat_out = None
-                    lon_out = None
+
+                # if (dbg.get("is_generic") and not allow_even_if_generic):
+                #     status_bisnis = f"Tidak ditemukan (nama_generik, score={best['score']:.2f})"
+                #     status_kode = 99
+                #     status_tutup = pd.NA
+                #     lat_out = None
+                #     lon_out = None
+
+                if dbg.get("is_generic"):
+                    # Tolak hanya kalau nama lemah DAN alamat juga lemah (jadi benar-benar generik)
+                    if (not name_signal_ok) and (not strong_addr):
+                        status_bisnis = f"Tidak ditemukan (nama_generik_lemah, score={best['score']:.2f})"
+                        status_kode = 99
+                        status_tutup = pd.NA
+                        lat_out = None
+                        lon_out = None
+                    else:
+                        # biarkan lanjut ke pemeriksaan alamat (atau accept)
+                        pass
+
 
                 else:
                     if alamat_in_ada and alamat_g_ada:
