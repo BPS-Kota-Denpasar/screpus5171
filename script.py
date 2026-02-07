@@ -1567,79 +1567,65 @@ try:
                 lon_out = best["lon"]
 
             elif has_coords and in_denpasar and not dbg.get("is_echo") and (score_ok or name_very_strong):
-                allow_even_if_generic = name_very_strong or (float(dbg.get("s_name_fuzzy", 0.0) or 0.0) >= 0.90)
-                strong_addr = (int(dbg.get("ov_addr", 0) or 0) >= 3) or (float(dbg.get("s_addr", 0.0) or 0.0) >= 0.35)
+                # ===== hitung sinyal alamat sekali, dipakai untuk generic & non-generic =====
+                ov_addr = int(dbg.get("ov_addr", 0) or 0)
+                s_addr = float(dbg.get("s_addr", 0.0) or 0.0)
 
+                a_in_alpha = addr_alpha_tokens(alamat_in)
+                a_g_alpha = addr_alpha_tokens(best.get("alamat") or "")
+                alpha_overlap = len(a_in_alpha & a_g_alpha)
 
-                # if (dbg.get("is_generic") and not allow_even_if_generic):
-                #     status_bisnis = f"Tidak ditemukan (nama_generik, score={best['score']:.2f})"
-                #     status_kode = 99
-                #     status_tutup = pd.NA
-                #     lat_out = None
-                #     lon_out = None
+                strong_addr = (ov_addr >= 3) or (s_addr >= 0.35) or (alpha_overlap >= 1)
 
-                if dbg.get("is_generic"):
-                    # Tolak hanya kalau nama lemah DAN alamat juga lemah (jadi benar-benar generik)
-                    if (not name_signal_ok) and (not strong_addr):
-                        status_bisnis = f"Tidak ditemukan (nama_generik_lemah, score={best['score']:.2f})"
-                        status_kode = 99
-                        status_tutup = pd.NA
-                        lat_out = None
-                        lon_out = None
+                # ===== default accept dulu (biar selalu ada assignment) =====
+                status_bisnis = "Ditemukan"
+                status_kode = 1
+                status_tutup = pd.NA
+                lat_out = best["lat"]
+                lon_out = best["lon"]
+
+                # ===== guard untuk nama generik yang lemah DAN alamat juga lemah =====
+                if dbg.get("is_generic") and (not name_signal_ok) and (not strong_addr):
+                    status_bisnis = f"Tidak ditemukan (nama_generik_lemah, score={best['score']:.2f})"
+                    status_kode = 99
+                    lat_out = None
+                    lon_out = None
+
+                # ===== jika alamat input & alamat gmaps sama-sama ada, lakukan lock alamat =====
+                elif alamat_in_ada and alamat_g_ada:
+                    # kalau nama super kuat, boleh abaikan alamat
+                    if float(dbg.get("s_name", 0.0) or 0.0) >= 0.92 or float(dbg.get("s_name_fuzzy", 0.0) or 0.0) >= 0.92:
+                        status_bisnis = "Ditemukan (nama sangat kuat; alamat diabaikan)"
                     else:
-                        # biarkan lanjut ke pemeriksaan alamat (atau accept)
-                        pass
+                        addr_lock_ok = True
+                        if len(a_in_alpha) >= 2:
+                            addr_lock_ok = (alpha_overlap >= 1) or (ov_addr >= 2) or (s_addr >= 0.18)
 
-
-                else:
-                    if alamat_in_ada and alamat_g_ada:
-                        ov_addr = int(dbg.get("ov_addr", 0) or 0)
-                        s_addr = float(dbg.get("s_addr", 0.0) or 0.0)
-
-                        if float(dbg.get("s_name", 0.0) or 0.0) >= 0.92 or float(dbg.get("s_name_fuzzy", 0.0) or 0.0) >= 0.92:
-                            status_bisnis = "Ditemukan (nama sangat kuat; alamat diabaikan)"
-                            status_kode = 1
-                            status_tutup = pd.NA
-                            lat_out = best["lat"]
-                            lon_out = best["lon"]
-                        else:
-                            a_in_alpha = addr_alpha_tokens(alamat_in)
-                            a_g_alpha = addr_alpha_tokens(best.get("alamat") or "")
-                            alpha_overlap = len(a_in_alpha & a_g_alpha)
-
-                            addr_lock_ok = True
-                            if len(a_in_alpha) >= 2:
-                                addr_lock_ok = (alpha_overlap >= 1) or (ov_addr >= 2) or (s_addr >= 0.18)
-
-                            if addr_lock_ok:
-                                status_bisnis = "Ditemukan"
-                                status_kode = 1
-                                status_tutup = pd.NA
-                                lat_out = best["lat"]
-                                lon_out = best["lon"]
-                            else:
-                                status_bisnis = (
-                                    f"Tidak ditemukan (alamat_tidak_match, score={best['score']:.2f}, "
-                                    f"alpha_overlap={alpha_overlap}, ov_addr={ov_addr}, s_addr={s_addr:.2f})"
-                                )
-                                status_kode = 99
-                                status_tutup = pd.NA
-                                lat_out = None
-                                lon_out = None
-
-                    else:
-                        if name_signal_ok:
-                            status_bisnis = "Ditemukan (nama+coords; alamat_gmaps_kosong)"
-                            status_kode = 1
-                            status_tutup = pd.NA
-                            lat_out = best["lat"]
-                            lon_out = best["lon"]
-                        else:
-                            status_bisnis = f"Tidak ditemukan (alamat_gmaps_kosong & nama_lemah, score={best['score']:.2f})"
+                        if not addr_lock_ok:
+                            status_bisnis = (
+                                f"Tidak ditemukan (alamat_tidak_match, score={best['score']:.2f}, "
+                                f"alpha_overlap={alpha_overlap}, ov_addr={ov_addr}, s_addr={s_addr:.2f})"
+                            )
                             status_kode = 99
-                            status_tutup = pd.NA
                             lat_out = None
                             lon_out = None
+
+                # ===== kalau salah satu alamat kosong, pakai nama sebagai sinyal =====
+                else:
+                    if name_signal_ok:
+                        status_bisnis = "Ditemukan (nama+coords; alamat_kosong)"
+                        status_kode = 1
+                        lat_out = best["lat"]
+                        lon_out = best["lon"]
+                    else:
+                        status_bisnis = f"Tidak ditemukan (alamat_kosong & nama_lemah, score={best['score']:.2f})"
+                        status_kode = 99
+                        lat_out = None
+                        lon_out = None
+
+
+
+                
 
             elif ALLOW_COORDS_ONLY_MATCH and has_coords and in_denpasar:
                 # pakai guard function yang sudah ada (biar fungsi kepakai, tidak cuma definisi)
